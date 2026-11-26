@@ -14,7 +14,7 @@ Config:
     "servers": [
       {"family": 4, "port": 25301,
        "delays": {"cached": 10, "longtail": 30, "uncached": 60},   # ms
-       "jitter": 0,          # extra random delay, 0..jitter ms
+       "jitter": 0,          # extra delay (ms) on every other answer of each kind
        "drop_every": 0,      # drop every Nth query (after the first `reliable_first`)
        "reliable_first": 2,  # always answer this many queries first (the warm-up)
        "rcode": null,        # e.g. "SERVFAIL" to always fail
@@ -27,7 +27,6 @@ popular names get an A record after the "cached" delay; anything else gets
 an A record after the "longtail" delay.
 """
 import json
-import random
 import socket
 import sys
 import threading
@@ -59,6 +58,7 @@ class Server:
         self.conf = conf
         self.popular = popular
         self.count = 0
+        self.per_category = {}
         self.lock = threading.Lock()
         family = socket.AF_INET6 if conf.get("family") == 6 else socket.AF_INET
         host = "::1" if family == socket.AF_INET6 else "127.0.0.1"
@@ -91,7 +91,10 @@ class Server:
                 category, rcode, answer = "longtail", 0, True
             if conf.get("rcode"):
                 rcode, answer = RCODES[conf["rcode"]], False
-            delay = conf.get("delays", {}).get(category, 0) + random.uniform(0, conf.get("jitter", 0))
+            with self.lock:
+                k = self.per_category[category] = self.per_category.get(category, 0) + 1
+            # deterministic jitter, so tests don't depend on luck
+            delay = conf.get("delays", {}).get(category, 0) + (conf.get("jitter", 0) if k % 2 else 0)
             reply = build_response(data, rcode, answer)
             timer = threading.Timer(delay / 1000.0, self.send, (reply, addr))
             timer.daemon = True
@@ -106,6 +109,11 @@ class Server:
 
 def main():
     config_path, ready_file = sys.argv[1], sys.argv[2]
+    if sys.platform == "win32":
+        # Windows timers tick every ~15.6 ms by default, which would make the
+        # configured delays very imprecise. Ask for 1 ms while we run.
+        import ctypes
+        ctypes.windll.winmm.timeBeginPeriod(1)
     with open(config_path) as f:
         config = json.load(f)
     popular = set(name.lower() for name in config.get("popular", []))

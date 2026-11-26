@@ -621,26 +621,35 @@ class EdgeCaseReport(unittest.TestCase):
 # ------------------------------------------------------ end-to-end tests
 
 class EndToEnd:
-    """Runs a script against the mock resolver. Subclasses set the command."""
+    """Runs a script against the mock resolver. Subclasses set the command.
+
+    The exact statistics are checked by the --analyze tests above; these
+    check the plumbing: right test in the right column, right units, right
+    status handling, parallel runs, raw file.
+    """
     ROUNDS = 2
+    DELAYS = {"Fast": {"cached": 10, "longtail": 80, "uncached": 160},
+              "Slow": {"cached": 250, "longtail": 320, "uncached": 400}}
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.v6 = ipv6_available()
         ports = free_udp_ports(10)
-        d = {"cached": 10, "longtail": 30, "uncached": 60}
+        # Busy CI machines (macOS especially) add tens of ms to the mock's
+        # delays, so the speed groups are far apart.
+        fast, slow = cls.DELAYS["Fast"], cls.DELAYS["Slow"]
         cls.servers = [
-            ("Fast", "127.0.0.1", {"delays": d}),
-            ("Fast-Twin", "127.0.0.1", {"delays": d}),
-            ("Slow", "127.0.0.1", {"delays": {"cached": 60, "longtail": 120, "uncached": 200}}),
-            ("Jittery", "127.0.0.1", {"delays": {"cached": 40, "longtail": 60, "uncached": 90}, "jitter": 40}),
-            ("Lossy", "127.0.0.1", {"delays": d, "drop_every": 3}),
+            ("Fast", "127.0.0.1", {"delays": fast}),
+            ("Fast-Twin", "127.0.0.1", {"delays": fast}),
+            ("Slow", "127.0.0.1", {"delays": slow}),
+            ("Jittery", "127.0.0.1", {"delays": {"cached": 150, "longtail": 220, "uncached": 290}, "jitter": 100}),
+            ("Lossy", "127.0.0.1", {"delays": fast, "drop_every": 3}),
             ("Servfail", "127.0.0.1", {"rcode": "SERVFAIL"}),
             ("Refuser", "127.0.0.1", {"rcode": "REFUSED"}),
             ("Closed", "127.0.0.1", {"closed": True}),
             ("Blackhole", "127.0.0.1", {"blackhole": True}),
-            ("Fast-v6", "::1", {"delays": {"cached": 15, "longtail": 35, "uncached": 65}}),
+            ("Fast-v6", "::1", {"delays": fast}),
         ]
         conf = {"popular": POPULAR, "servers": []}
         lines = []
@@ -682,31 +691,36 @@ class EndToEnd:
     def test_ranking(self):
         ranked = self.rep["ranked"]
         names = [r["name"] for r in ranked]
-        self.assertEqual(set(names[:2]), {"Fast", "Fast-Twin"}, self.out)
-        self.assertTrue(ranked[0]["tied"] and ranked[1]["tied"], self.out)
-        for later in ("Slow", "Jittery"):
-            self.assertIn(later, names)
-            row = ranked[names.index(later)]
-            self.assertFalse(row["tied"], self.out)
-        if self.v6:
-            self.assertIn("Fast-v6", names, self.out)
-        else:
+        fast_group = {"Fast", "Fast-Twin", "Fast-v6"} if self.v6 else {"Fast", "Fast-Twin"}
+        # identically configured servers: any order, all statistically tied
+        self.assertEqual(set(names[:len(fast_group)]), fast_group, self.out)
+        self.assertTrue(all(r["tied"] for r in ranked[:len(fast_group)]), self.out)
+        self.assertEqual(set(names[len(fast_group):]), {"Slow", "Jittery"}, self.out)
+        self.assertFalse(any(r["tied"] for r in ranked[len(fast_group):]), self.out)
+        if not self.v6:
             self.assertIn("the only IPv6 server did not answer", self.out)
             self.assertNotIn("Fast-v6", self.out)
 
     def test_medians_match_configured_delays(self):
         rows = {r["name"]: r for r in self.rep["ranked"]}
-        tol = 15  # generous: CI machines are noisy
-        for name, (c, u, l) in {"Fast": (10, 60, 30), "Slow": (60, 200, 120)}.items():
+        for name, delays in self.DELAYS.items():
             r = rows[name]
-            self.assertTrue(c - 1 <= r["cached"] <= c + tol, (name, r))
-            self.assertTrue(u - 1 <= r["uncached"] <= u + tol, (name, r))
-            self.assertTrue(l - 1 <= r["longtail"] <= l + tol, (name, r))
+            for col in CATS:
+                # never faster than the mock's delay; the loose upper bound
+                # catches unit mix-ups (seconds, microseconds), not noise
+                self.assertTrue(delays[col] - 2 <= r[col] <= 2 * delays[col] + 100, (name, col, r))
+            self.assertTrue(r["cached"] < r["longtail"] < r["uncached"], (name, r))
             self.assertEqual(r["fail"], 0)
+        for col in CATS:
+            self.assertLess(rows["Fast"][col], rows["Slow"][col], col)
 
     def test_jitter(self):
-        rows = {r["name"]: r for r in self.rep["ranked"]}
-        self.assertGreater(rows["Jittery"]["jitter"], rows["Fast"]["jitter"] + 5, self.out)
+        # Jittery adds 100 ms to every other answer: half its cached lookups
+        # take ~150 ms and half ~250 ms, a standard deviation of ~53 ms. Allow
+        # for timer noise on busy CI machines, which hits every server.
+        rows = {r["name"]: r for r in self.rep["ranked"] + self.rep["unreliable"]}
+        self.assertGreater(rows["Jittery"]["jitter"], 35, self.out)
+        self.assertGreater(rows["Jittery"]["jitter"], rows["Fast"]["jitter"] + 10, self.out)
         self.assertGreater(rows["Jittery"]["p95"], rows["Jittery"]["score"], self.out)
 
     def test_lossy_server_is_unreliable(self):

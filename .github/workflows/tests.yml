@@ -1,0 +1,66 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (bash 5, pwsh 7)
+            os: ubuntu-latest
+          - name: macOS (/bin/bash 3.2, BSD tools, pwsh 7)
+            os: macos-latest
+            bash: /bin/bash
+          - name: Windows PowerShell 5.1
+            os: windows-latest
+            pwsh: powershell
+          - name: Windows pwsh 7
+            os: windows-latest
+            pwsh: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dig and shellcheck
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bind9-dnsutils shellcheck
+
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck dns_speed_test_macos.sh
+
+      - name: Show tool versions
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "${BASH_BIN:-bash}" --version | head -1
+            dig -v 2>&1 | head -1
+          fi
+          python --version
+        env:
+          BASH_BIN: ${{ matrix.bash }}
+
+      - name: Run tests
+        run: python tests/test_benchmark.py -v
+        env:
+          BASH_BIN: ${{ matrix.bash }}
+          PWSH_BIN: ${{ matrix.pwsh }}
+          # the bash script is for macOS/Linux
+          SKIP_BASH: ${{ runner.os == 'Windows' && '1' || '' }}
